@@ -51,7 +51,8 @@ struct UserIdInvalid<I> { user_id: I }
 Notably:
 
 1. One context selector is created for each enum variant.
-1. The name of the selector is the same as the enum variant's name.
+1. The name of the selector is the same as the enum variant's name,
+   unless a different name is specified using the `context` attribute.
 1. The `source` and `backtrace` fields have been removed; the
    library will automatically handle this for you.
 1. Each remaining field's type has been replaced with a generic

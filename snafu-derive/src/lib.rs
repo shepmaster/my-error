@@ -47,6 +47,7 @@ struct VariantInfo {
 
 enum ContextSelectorKind {
     Context {
+        selector_name: syn::Ident,
         source_field: Option<SourceField>,
         user_fields: Vec<Field>,
     },
@@ -723,34 +724,48 @@ fn parse_snafu_enum(
             let (visibility, errs) = visibilities.finish();
             errors.extend(errs);
 
-            let (is_context, errs) = contexts.finish();
+            let (context_arg, errs) = contexts.finish();
             errors.extend(errs);
 
             let source_field = source.map(|(val, _tts)| val);
 
-            let selector_kind = if is_context.unwrap_or(true) {
-                ContextSelectorKind::Context {
-                    source_field,
-                    user_fields,
+            // if no context argument is specified, that's the same as specifying context(true)
+            let context_arg = context_arg.unwrap_or(ContextAttributeArgument::Enabled(true));
+
+            let selector_kind = match context_arg {
+                ContextAttributeArgument::Enabled(enabled) => {
+                    if enabled {
+                        ContextSelectorKind::Context {
+                            selector_name: name.clone(),
+                            source_field,
+                            user_fields,
+                        }
+                    } else {
+                        errors.extend(
+                            user_fields.into_iter().map(|Field { original, .. }| {
+                                syn::Error::new_spanned(
+                                    original,
+                                    "Context selectors without context must not have context fields",
+                                )
+                            })
+                        );
+
+                        let source_field = source_field.ok_or_else(|| {
+                                vec![syn::Error::new(
+                                    variant_span,
+                                    "Context selectors without context must have a source field",
+                                )]
+                            })?;
+                        ContextSelectorKind::NoContext { source_field }
+                    }
+                },
+                ContextAttributeArgument::CustomName(selector_name) => {
+                    ContextSelectorKind::Context {
+                        selector_name,
+                        source_field,
+                        user_fields,
+                    }
                 }
-            } else {
-                errors.extend(
-                    user_fields.into_iter().map(|Field { original, .. }| {
-                        syn::Error::new_spanned(
-                            original,
-                            "Context selectors without context must not have context fields",
-                        )
-                    })
-                );
-
-                let source_field = source_field.ok_or_else(|| {
-                        vec![syn::Error::new(
-                            variant_span,
-                            "Context selectors without context must have a source field",
-                        )]
-                    })?;
-
-                ContextSelectorKind::NoContext { source_field }
             };
 
             Ok(VariantInfo {
@@ -1013,8 +1028,13 @@ enum SnafuAttribute {
     Visibility(proc_macro2::TokenStream, UserInput),
     Source(proc_macro2::TokenStream, Vec<Source>),
     Backtrace(proc_macro2::TokenStream, bool),
-    Context(proc_macro2::TokenStream, bool),
+    Context(proc_macro2::TokenStream, ContextAttributeArgument),
     DocComment(proc_macro2::TokenStream, String),
+}
+
+enum ContextAttributeArgument {
+    Enabled(bool),
+    CustomName(syn::Ident),
 }
 
 impl syn::parse::Parse for SnafuAttribute {
@@ -1060,10 +1080,26 @@ impl syn::parse::Parse for SnafuAttribute {
             }
         } else if name == "context" {
             if input.is_empty() {
-                Ok(SnafuAttribute::Context(input_tts, true))
+                Ok(SnafuAttribute::Context(
+                    input_tts,
+                    ContextAttributeArgument::Enabled(true),
+                ))
             } else {
-                let v: MyParens<LitBool> = input.parse()?;
-                Ok(SnafuAttribute::Context(input_tts, v.0.value))
+                let inside;
+                parenthesized!(inside in input);
+                if inside.peek(LitBool) {
+                    let v: LitBool = inside.parse()?;
+                    Ok(SnafuAttribute::Context(
+                        input_tts,
+                        ContextAttributeArgument::Enabled(v.value),
+                    ))
+                } else {
+                    let v: Ident = inside.parse()?;
+                    Ok(SnafuAttribute::Context(
+                        input_tts,
+                        ContextAttributeArgument::CustomName(v),
+                    ))
+                }
             }
         } else {
             Err(syn::Error::new(
@@ -1330,6 +1366,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
 
         match selector_kind {
             ContextSelectorKind::Context {
+                selector_name,
                 user_fields,
                 source_field,
             } => {
@@ -1344,7 +1381,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
                     .unwrap_or(&self.0.default_visibility);
 
                 let generics_list = quote! { <#(#original_lifetimes,)* #(#generic_names,)* #(#original_generic_types_without_defaults,)*> };
-                let selector_name = quote! { #variant_name<#(#generic_names,)*> };
+                let selector_type = quote! { #selector_name<#(#generic_names,)*> };
 
                 let names: Vec<_> = user_fields.iter().map(|f| f.name.clone()).collect();
                 let selector_doc = format!(
@@ -1357,7 +1394,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
                         quote! {
                             #[derive(Debug, Copy, Clone)]
                             #[doc = #selector_doc]
-                            #visibility struct #selector_name;
+                            #visibility struct #selector_type;
                         }
                     } else {
                         let visibilities = iter::repeat(visibility);
@@ -1365,7 +1402,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
                         quote! {
                             #[derive(Debug, Copy, Clone)]
                             #[doc = #selector_doc]
-                            #visibility struct #selector_name {
+                            #visibility struct #selector_type {
                                 #(
                                     #[allow(missing_docs)]
                                     #visibilities #names: #generic_names
@@ -1387,7 +1424,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
 
                 let inherent_impl = if source_field.is_none() {
                     quote! {
-                    impl<#(#generic_names,)*> #selector_name
+                    impl<#(#generic_names,)*> #selector_type
                     {
                         #[doc = "Consume the selector and return a `Result` with the associated error"]
                         #visibility fn fail<#(#original_generics_without_defaults,)* __T>(self) -> core::result::Result<__T, #parameterized_enum_name>
@@ -1438,7 +1475,7 @@ impl<'a> quote::ToTokens for ContextSelector<'a> {
                     }
 
                     quote! {
-                        impl#generics_list snafu::IntoError<#parameterized_enum_name> for #selector_name
+                        impl#generics_list snafu::IntoError<#parameterized_enum_name> for #selector_type
                         where
                             #parameterized_enum_name: snafu::Error + snafu::ErrorCompat,
                             #(#where_clauses),*
