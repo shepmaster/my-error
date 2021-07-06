@@ -1,7 +1,52 @@
+pub(crate) use self::context_module::ContextModule;
 pub(crate) use self::context_selector::ContextSelector;
 pub(crate) use self::display::{Display, DisplayMatchArm};
 pub(crate) use self::error::{Error, ErrorSourceMatchArm};
 pub(crate) use self::error_compat::{ErrorCompat, ErrorCompatBacktraceMatchArm};
+
+pub mod context_module {
+    use crate::ModuleName;
+    use heck::SnakeCase;
+    use proc_macro2::TokenStream;
+    use quote::{quote, ToTokens};
+    use syn::Ident;
+
+    #[derive(Copy, Clone)]
+    pub(crate) struct ContextModule<'a, T> {
+        pub container_name: &'a Ident,
+        pub module_name: &'a ModuleName,
+        pub visibility: Option<&'a dyn ToTokens>,
+        pub body: &'a T,
+    }
+
+    impl<'a, T> ToTokens for ContextModule<'a, T>
+    where
+        T: ToTokens,
+    {
+        fn to_tokens(&self, stream: &mut TokenStream) {
+            let module_name = match self.module_name {
+                ModuleName::Default => {
+                    let name_str = self.container_name.to_string().to_snake_case();
+                    syn::Ident::new(&name_str, self.container_name.span())
+                }
+                ModuleName::Custom(name) => name.clone(),
+            };
+
+            let visibility = self.visibility;
+            let body = self.body;
+
+            let module_tokens = quote! {
+                #visibility mod #module_name {
+                    use super::*;
+
+                    #body
+                }
+            };
+
+            stream.extend(module_tokens);
+        }
+    }
+}
 
 pub mod context_selector {
     use crate::{ContextSelectorKind, Field, SuffixKind};
