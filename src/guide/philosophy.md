@@ -6,7 +6,7 @@ effectively use SNAFU.
 
 ## Categorize underlying errors by their context
 
-It should be easy to bin one underlying error type (such as
+It should be easy to classify one underlying error type (such as
 [`io::Error`][Error]) into multiple domain-specific errors while
 optionally adding contextual information.
 
