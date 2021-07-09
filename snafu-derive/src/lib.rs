@@ -24,6 +24,11 @@ type MultiSynResult<T> = std::result::Result<T, Vec<syn::Error>>;
 /// Some arbitrary tokens we treat as a black box
 type UserInput = Box<dyn quote::ToTokens>;
 
+enum ModuleName {
+    Default,
+    Custom(syn::Ident),
+}
+
 enum SnafuInfo {
     Enum(EnumInfo),
     NamedStruct(NamedStructInfo),
@@ -36,6 +41,7 @@ struct EnumInfo {
     generics: syn::Generics,
     variants: Vec<FieldContainer>,
     default_visibility: UserInput,
+    module: Option<ModuleName>,
 }
 
 struct FieldContainer {
@@ -45,6 +51,7 @@ struct FieldContainer {
     display_format: Option<UserInput>,
     doc_comment: String,
     visibility: Option<UserInput>,
+    module: Option<ModuleName>,
 }
 
 enum SuffixKind {
@@ -505,6 +512,11 @@ const ATTR_VISIBILITY: OnlyValidOn = OnlyValidOn {
     valid_on: "an enum, enum variants, or a struct with named fields",
 };
 
+const ATTR_MODULE: OnlyValidOn = OnlyValidOn {
+    attribute: "module",
+    valid_on: "an enum or structs with named fields",
+};
+
 const ATTR_CONTEXT: OnlyValidOn = OnlyValidOn {
     attribute: "context",
     valid_on: "enum variants or structs with named fields",
@@ -534,6 +546,7 @@ fn parse_snafu_enum(
 
     let mut errors = SyntaxErrors::default();
 
+    let mut modules = AtMostOne::new("module", ErrorLocation::OnEnum);
     let mut default_visibilities = AtMostOne::new("visibility", ErrorLocation::OnEnum);
     let mut crate_roots = AtMostOne::new("crate_root", ErrorLocation::OnEnum);
     let mut enum_errors = errors.scoped(ErrorLocation::OnEnum);
@@ -555,6 +568,7 @@ fn parse_snafu_enum(
             SnafuAttribute::CrateRoot(tokens, root) => {
                 crate_roots.add(root, tokens);
             }
+            SnafuAttribute::Module(tokens, v) => modules.add(v, tokens),
             SnafuAttribute::Backtrace(tokens, ..) => enum_errors.add(tokens, ATTR_BACKTRACE),
             SnafuAttribute::Context(tokens, ..) => enum_errors.add(tokens, ATTR_CONTEXT),
             SnafuAttribute::Whatever(tokens) => enum_errors.add(tokens, ATTR_WHATEVER),
@@ -562,8 +576,20 @@ fn parse_snafu_enum(
         }
     }
 
+    let (module, errs) = modules.finish();
+    errors.extend(errs);
+
+    let default_default_visibility = match module {
+        Some(_) => {
+            // Default to pub visibility since private context selectors wouldn't
+            // be accessible outside the module.
+            pub_visibility
+        }
+        None => private_visibility,
+    };
+
     let (maybe_default_visibility, errs) = default_visibilities.finish();
-    let default_visibility = maybe_default_visibility.unwrap_or_else(private_visibility);
+    let default_visibility = maybe_default_visibility.unwrap_or_else(default_default_visibility);
     errors.extend(errs);
 
     let (maybe_crate_root, errs) = crate_roots.finish();
@@ -610,6 +636,7 @@ fn parse_snafu_enum(
         generics,
         variants,
         default_visibility,
+        module,
     })
 }
 
@@ -627,6 +654,7 @@ fn field_container(
 
     let mut outer_errors = errors.scoped(outer_error_location);
 
+    let mut modules = AtMostOne::new("module", outer_error_location);
     let mut display_formats = AtMostOne::new("display", outer_error_location);
     let mut visibilities = AtMostOne::new("visibility", outer_error_location);
     let mut contexts = AtMostOne::new("context", outer_error_location);
@@ -636,6 +664,7 @@ fn field_container(
 
     for attr in attrs {
         match attr {
+            SnafuAttribute::Module(tokens, n) => modules.add(n, tokens),
             SnafuAttribute::Display(tokens, d) => display_formats.add(d, tokens),
             SnafuAttribute::Visibility(tokens, v) => visibilities.add(v, tokens),
             SnafuAttribute::Context(tokens, c) => contexts.add(c, tokens),
@@ -738,6 +767,7 @@ fn field_container(
                         field_errors.add(tokens, ATTR_BACKTRACE_FALSE);
                     }
                 }
+                SnafuAttribute::Module(tokens, ..) => field_errors.add(tokens, ATTR_MODULE),
                 SnafuAttribute::Visibility(tokens, ..) => field_errors.add(tokens, ATTR_VISIBILITY),
                 SnafuAttribute::Display(tokens, ..) => field_errors.add(tokens, ATTR_DISPLAY),
                 SnafuAttribute::Context(tokens, ..) => field_errors.add(tokens, ATTR_CONTEXT),
@@ -813,6 +843,9 @@ fn field_container(
         }
         _ => {} // no conflict
     }
+
+    let (module, errs) = modules.finish();
+    errors.extend(errs);
 
     let (display_format, errs) = display_formats.finish();
     errors.extend(errs);
@@ -908,6 +941,7 @@ fn field_container(
         display_format,
         doc_comment,
         visibility,
+        module,
     })
 }
 
@@ -995,6 +1029,7 @@ fn parse_snafu_tuple_struct(
 
     for attr in attributes_from_syn(attrs)? {
         match attr {
+            SnafuAttribute::Module(tokens, ..) => struct_errors.add(tokens, ATTR_MODULE),
             SnafuAttribute::Display(tokens, ..) => struct_errors.add(tokens, ATTR_DISPLAY),
             SnafuAttribute::Visibility(tokens, ..) => struct_errors.add(tokens, ATTR_VISIBILITY),
             SnafuAttribute::Source(tokens, ss) => {
@@ -1085,6 +1120,7 @@ enum SnafuAttribute {
     Whatever(proc_macro2::TokenStream),
     CrateRoot(proc_macro2::TokenStream, UserInput),
     DocComment(proc_macro2::TokenStream, String),
+    Module(proc_macro2::TokenStream, ModuleName),
 }
 
 fn default_crate_root() -> UserInput {
@@ -1093,6 +1129,10 @@ fn default_crate_root() -> UserInput {
 
 fn private_visibility() -> UserInput {
     Box::new(quote! {})
+}
+
+fn pub_visibility() -> UserInput {
+    Box::new(syn::token::Pub(proc_macro2::Span::call_site()))
 }
 
 impl From<SnafuInfo> for proc_macro::TokenStream {
@@ -1207,8 +1247,24 @@ impl EnumInfo {
         let error_impl = ErrorImpl(&self);
         let error_compat_impl = ErrorCompatImpl(&self);
 
+        let context = match self.module {
+            None => quote! { #context_selectors },
+            Some(ref module_name) => {
+                use crate::shared::ContextModule;
+
+                let context_module = ContextModule {
+                    container_name: self.name(),
+                    body: &context_selectors,
+                    visibility: Some(&self.default_visibility),
+                    module_name,
+                };
+
+                quote! { #context_module }
+            }
+        };
+
         quote! {
-            #context_selectors
+            #context
             #display_impl
             #error_impl
             #error_compat_impl
@@ -1433,6 +1489,7 @@ impl NamedStructInfo {
                     display_format,
                     doc_comment,
                     visibility,
+                    module,
                 },
             ..
         } = &self;
@@ -1504,6 +1561,17 @@ impl NamedStructInfo {
 
         let selector_doc_string = format!("SNAFU context selector for the `{}` error", name);
 
+        let pub_visibility = pub_visibility();
+        let selector_visibility = match (visibility, module) {
+            (Some(ref v), _) => Some(&**v),
+            (None, Some(_)) => {
+                // Default to pub visibility since private context selectors
+                // wouldn't be accessible outside the module.
+                Some(&pub_visibility as &dyn quote::ToTokens)
+            }
+            (None, None) => None,
+        };
+
         let context_selector = ContextSelector {
             backtrace_field: backtrace_field.as_ref(),
             crate_root: &crate_root,
@@ -1514,15 +1582,31 @@ impl NamedStructInfo {
             selector_kind: &selector_kind,
             selector_name: &field_container.name,
             user_fields: &user_fields,
-            visibility: visibility.as_ref().map(|x| &**x),
+            visibility: selector_visibility,
             where_clauses: &where_clauses,
+        };
+
+        let context = match module {
+            None => quote! { #context_selector },
+            Some(module_name) => {
+                use crate::shared::ContextModule;
+
+                let context_module = ContextModule {
+                    container_name: self.name(),
+                    body: &context_selector,
+                    visibility: visibility.as_ref().map(|x| &**x),
+                    module_name,
+                };
+
+                quote! { #context_module }
+            }
         };
 
         quote! {
             #error_impl
             #error_compat_impl
             #display_impl
-            #context_selector
+            #context
         }
     }
 }

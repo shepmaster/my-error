@@ -1,4 +1,4 @@
-use crate::SnafuAttribute;
+use crate::{ModuleName, SnafuAttribute};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
 use syn::{
@@ -18,6 +18,7 @@ mod kw {
     custom_keyword!(whatever);
     custom_keyword!(source);
     custom_keyword!(visibility);
+    custom_keyword!(module);
 
     custom_keyword!(from);
 
@@ -65,6 +66,7 @@ enum Attribute {
     Whatever(Whatever),
     Source(Source),
     Visibility(Visibility),
+    Module(Module),
 }
 
 impl From<Attribute> for SnafuAttribute {
@@ -79,6 +81,7 @@ impl From<Attribute> for SnafuAttribute {
             Whatever(o) => SnafuAttribute::Whatever(o.to_token_stream()),
             Source(s) => SnafuAttribute::Source(s.to_token_stream(), s.into_components()),
             Visibility(v) => SnafuAttribute::Visibility(v.to_token_stream(), v.into_arbitrary()),
+            Module(v) => SnafuAttribute::Module(v.to_token_stream(), v.into_value()),
         }
     }
 }
@@ -100,6 +103,8 @@ impl Parse for Attribute {
             input.parse().map(Attribute::Source)
         } else if lookahead.peek(kw::visibility) {
             input.parse().map(Attribute::Visibility)
+        } else if lookahead.peek(kw::module) {
+            input.parse().map(Attribute::Module)
         } else {
             Err(lookahead.error())
         }
@@ -529,6 +534,36 @@ impl ToTokens for Visibility {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.visibility_token.to_tokens(tokens);
         self.visibility.to_tokens(tokens);
+    }
+}
+
+struct Module {
+    module_token: kw::module,
+    arg: MaybeArg<Ident>,
+}
+
+impl Module {
+    fn into_value(self) -> ModuleName {
+        match self.arg.into_option() {
+            None => ModuleName::Default,
+            Some(name) => ModuleName::Custom(name),
+        }
+    }
+}
+
+impl Parse for Module {
+    fn parse(input: ParseStream) -> Result<Self> {
+        Ok(Self {
+            module_token: input.parse()?,
+            arg: input.parse()?,
+        })
+    }
+}
+
+impl ToTokens for Module {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        self.module_token.to_tokens(tokens);
+        self.arg.to_tokens(tokens);
     }
 }
 
